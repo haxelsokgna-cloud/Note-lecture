@@ -70,7 +70,12 @@ select{flex:1;min-width:0;background:var(--surface);border:1px solid var(--line)
 #pdfView,#imgView{margin-top:18px;display:grid;gap:14px}
 .page{position:relative;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.12);margin:0 auto;max-width:100%}
 .page canvas{position:absolute;inset:0;width:100%;height:100%}
-.imgpage{width:100%;cursor:crosshair}
+.imgpage{width:100%;cursor:pointer}
+.imgpage.drawing{touch-action:pinch-zoom;cursor:crosshair}
+.imgTools{position:sticky;top:calc(env(safe-area-inset-top,0px) + 65px);z-index:4;background:var(--bg);display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding-block:8px;margin-top:10px}
+.shapeLayer{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+.shapeLayer rect{mix-blend-mode:multiply}
+.pin.mini{width:20px;height:20px;margin:-10px 0 0 -10px;font-size:10px;border-width:1.5px}
 .imgpage img{display:block;width:100%;height:100%;object-fit:contain;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 .hlLayer,.pinLayer{position:absolute;inset:0;pointer-events:none}
 .hlLayer div{position:absolute;opacity:.55;mix-blend-mode:multiply;border-radius:2px}
@@ -201,6 +206,8 @@ input[type=number]{width:100%;background:var(--surface);border:1px solid var(--l
   <textarea id="inlineTa" hidden aria-label="Texte du document" placeholder="Écrivez ou collez votre texte ici…"></textarea>
   <article id="reader"></article>
   <div id="pdfView" hidden></div>
+  <div class="imgTools" id="imgTools" hidden><span class="lbl">Outil</span>
+    <div class="seg"><button data-tool="pin">Repère</button><button data-tool="box">Surligner</button><button data-tool="line">Souligner</button></div></div>
   <div id="imgView" hidden></div>
   <details class="notes" id="notesBox">
     <summary><h2 id="notesTitle">Notes</h2><span class="chev" aria-hidden="true"></span></summary>
@@ -438,7 +445,7 @@ $('themeSeg').querySelectorAll('button').forEach(b=>b.onclick=()=>{prefs.theme=b
 
 /* ---------- Rendu ---------- */
 function markLabel(d,m){
-  if(d.type==='img') return `Photo ${m.page} · Repère ${pinNumbers(d)[m.id]||''}`;
+  if(d.type==='img') return `Photo ${m.page} · ${m.shape==='box'?'Surlignage':m.shape==='line'?'Soulignement':'Repère'} ${pinNumbers(d)[m.id]||''}`;
   return (d.type==='pdf'?`p. ${m.page} · `:'')+'« '+m.quote.replace(/\s+/g,' ')+' »';
 }
 function sortMarks(d){
@@ -452,7 +459,7 @@ function pinNumbers(d){const o={};sortMarks(d).forEach((m,i)=>o[m.id]=i+1);retur
 const HINTS={
   text:'Sélectionnez un mot ou une phrase, puis « Surligner » ou « Ajouter une note ». Touchez un passage surligné pour lire ou modifier sa note.',
   pdf:'Sélectionnez du texte dans le PDF, puis « Surligner » ou « Ajouter une note ». Touchez une zone surlignée pour ouvrir sa note.',
-  img:'Touchez la photo à l\'endroit voulu, puis « Ajouter une note ici ». Touchez un repère numéroté pour ouvrir sa note.'
+  img:'Repère : touchez la photo. Surligner ou Souligner : faites glisser le doigt sur la photo (pour défiler dans ces modes, utilisez deux doigts). Touchez un élément pour ouvrir sa note.'
 };
 function render(){
   const d=doc(); state.current=d.id;
@@ -461,7 +468,7 @@ function render(){
   document.body.classList.toggle('wide',d.type!=='text');
   $('hint').textContent=HINTS[d.type];
   $('inlineBar').hidden=d.type!=='text'||inlineOn;
-  $('reader').hidden=d.type!=='text'; $('pdfView').hidden=d.type!=='pdf'; $('imgView').hidden=d.type!=='img';
+  $('reader').hidden=d.type!=='text'; $('pdfView').hidden=d.type!=='pdf'; $('imgView').hidden=d.type!=='img'; $('imgTools').hidden=d.type!=='img';
   if(d.type==='pdf'){ closeImg(); if(shownDocId!==d.id) openPdf(d); else drawPdfMarks(); }
   else if(d.type==='img'){ closePdf(); if(shownDocId!==d.id) openImg(d); else drawPins(); }
   else { closePdf(); closeImg(); renderText(d); if(inlineOn) $('reader').hidden=true; }
@@ -602,32 +609,88 @@ function openImg(d){
     const div=document.createElement('div'); div.className='page imgpage'; div.dataset.page=i+1;
     div.style.aspectRatio=`${p.w} / ${p.h}`;
     const img=document.createElement('img'); img.alt=`Photo ${i+1}`; img.draggable=false;
-    div.append(img); div.insertAdjacentHTML('beforeend',`<div class="pinLayer"></div><span class="pgnum">${i+1}</span>`);
-    div.addEventListener('click',onImgClick);
+    div.append(img); div.insertAdjacentHTML('beforeend',`<svg class="shapeLayer" viewBox="0 0 1 1" preserveAspectRatio="none"></svg><div class="pinLayer"></div><span class="pgnum">${i+1}</span>`);
+    div.addEventListener('pointerdown',onImgDown);
     v.appendChild(div);
     getFile(p.id,p.asset).then(b=>{ if(doc().id!==d.id) return;
       if(!b){div.insertAdjacentHTML('afterbegin','<div class="loading" style="position:absolute;inset:0;padding:16px">Photo pas encore disponible sur cet appareil.</div>');return}
       const u=URL.createObjectURL(b); pageUrls.push(u); img.src=u; });
   });
-  drawPins();
+  drawPins(); paintTools();
+}
+/* outils sur les photos : repère, surligner (rectangle), souligner (trait) */
+const SVGNS='http://www.w3.org/2000/svg';
+const HEX={jaune:'#FFD43B',vert:'#8CE07A',bleu:'#7DBBFF',rose:'#FF8EC4',orange:'#FFA858'};
+const LINEHEX={jaune:'#E6B800',vert:'#3FA34D',bleu:'#2F7FE0',rose:'#E0479A',orange:'#E57C1A'};
+let imgTool='pin'; try{imgTool=localStorage.getItem(KEY+'-imgTool')||'pin'}catch(e){}
+function paintTools(){
+  $('imgTools').querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.tool===imgTool));
+  document.querySelectorAll('.imgpage').forEach(p=>p.classList.toggle('drawing',imgTool!=='pin'));
+}
+$('imgTools').querySelectorAll('button').forEach(b=>b.onclick=()=>{imgTool=b.dataset.tool;try{localStorage.setItem(KEY+'-imgTool',imgTool)}catch(e){}hideFab();paintTools()});
+function shapeEl(sh,color,cls){
+  const el=document.createElementNS(SVGNS,sh.shape==='box'?'rect':'line'); el.setAttribute('class',cls);
+  el.setAttribute('vector-effect','non-scaling-stroke');
+  if(sh.shape==='box'){const [x,y,w,h]=sh.box; el.setAttribute('x',x);el.setAttribute('y',y);el.setAttribute('width',w);el.setAttribute('height',h);el.setAttribute('fill',HEX[color]);el.setAttribute('fill-opacity','.45')}
+  else{const [x1,y1,x2,y2]=sh.line; el.setAttribute('x1',x1);el.setAttribute('y1',y1);el.setAttribute('x2',x2);el.setAttribute('y2',y2);el.setAttribute('stroke',LINEHEX[color]);el.setAttribute('stroke-width','4');el.setAttribute('stroke-linecap','round')}
+  return el;
 }
 function drawPins(){
   const d=doc(); if(d.type!=='img') return;
   const nums=pinNumbers(d);
-  $('imgView').querySelectorAll('.pinLayer').forEach(l=>l.querySelectorAll('.pin:not(.temp)').forEach(x=>x.remove()));
+  $('imgView').querySelectorAll('.imgpage').forEach(pg=>{pg.querySelectorAll('.pin:not(.temp)').forEach(x=>x.remove());pg.querySelectorAll('.shapeLayer .sh').forEach(x=>x.remove())});
   d.marks.forEach(m=>{
-    const layer=$('imgView').querySelector(`.page[data-page="${m.page}"] .pinLayer`); if(!layer) return;
-    const p=document.createElement('div'); p.className='pin pg-c-'+m.color+(activeMark===m.id?' active':'');
-    p.style.left=m.x*100+'%'; p.style.top=m.y*100+'%'; p.textContent=nums[m.id]; layer.appendChild(p);
+    const pg=$('imgView').querySelector(`.page[data-page="${m.page}"]`); if(!pg) return;
+    const act=activeMark===m.id, p=document.createElement('div');
+    if(m.shape){
+      const el=shapeEl(m,m.color,'sh'); if(act){el.setAttribute('stroke','#1B2130');el.setAttribute('stroke-width',m.shape==='box'?'2':'6')}
+      pg.querySelector('.shapeLayer').appendChild(el);
+      const [bx,by]=m.shape==='box'?m.box:m.line;
+      p.className='pin mini pg-c-'+m.color+(act?' active':''); p.style.left=bx*100+'%'; p.style.top=by*100+'%';
+    } else { p.className='pin pg-c-'+m.color+(act?' active':''); p.style.left=m.x*100+'%'; p.style.top=m.y*100+'%' }
+    p.textContent=nums[m.id]; pg.querySelector('.pinLayer').appendChild(p);
   });
 }
-function clearTempPin(){document.querySelectorAll('.pin.temp').forEach(x=>x.remove())}
-function onImgClick(e){
-  if(anySheet()) return;
+function clearTempPin(){document.querySelectorAll('.pin.temp,.shapeLayer .tmp').forEach(x=>x.remove())}
+const r4=v=>Math.round(Math.min(1,Math.max(0,v))*10000)/10000;
+function shapeFrom(x0,y0,x1,y1){
+  if(imgTool==='box'){const x=Math.min(x0,x1),y=Math.min(y0,y1),w=Math.abs(x1-x0),h=Math.abs(y1-y0);return{shape:'box',box:[r4(x),r4(y),r4(w),r4(h)],x:r4(x+w/2),y:r4(y+h/2)}}
+  return{shape:'line',line:[r4(x0),r4(y0),r4(x1),r4(y1)],x:r4((x0+x1)/2),y:r4((y0+y1)/2)};
+}
+function hitImg(n,x,y,r){
+  const ms=doc().marks.filter(m=>m.page===n), px=(a,b)=>Math.hypot(a*r.width,b*r.height);
+  const segDist=(m)=>{const [x1,y1,x2,y2]=m.line, dx=(x2-x1)*r.width, dy=(y2-y1)*r.height, L=dx*dx+dy*dy;
+    let t=L?(((x-x1)*r.width)*dx+((y-y1)*r.height)*dy)/L:0; t=Math.max(0,Math.min(1,t)); return Math.hypot((x-x1)*r.width-t*dx,(y-y1)*r.height-t*dy)};
+  return ms.find(m=>!m.shape&&px(m.x-x,m.y-y)<20)
+    ||ms.find(m=>m.shape==='line'&&segDist(m)<14)
+    ||ms.find(m=>m.shape==='box'&&x>=m.box[0]-.01&&x<=m.box[0]+m.box[2]+.01&&y>=m.box[1]-.01&&y<=m.box[1]+m.box[3]+.01);
+}
+function onImgDown(e){
+  if(anySheet()||e.button>0) return;
   const p=e.currentTarget, r=p.getBoundingClientRect(), n=+p.dataset.page;
-  const x=(e.clientX-r.left)/r.width, y=(e.clientY-r.top)/r.height;
-  const hit=doc().marks.filter(m=>m.page===n).find(m=>Math.hypot((m.x-x)*r.width,(m.y-y)*r.height)<20);
+  const fx=v=>(v-r.left)/r.width, fy=v=>(v-r.top)/r.height, x0=fx(e.clientX), y0=fy(e.clientY);
+  const draw=imgTool!=='pin'; let moved=false;
+  if(draw){ try{p.setPointerCapture(e.pointerId)}catch(err){} e.preventDefault(); }
+  const move=ev=>{
+    if(!draw) return; const x1=fx(ev.clientX), y1=fy(ev.clientY);
+    if(!moved&&Math.hypot((x1-x0)*r.width,(y1-y0)*r.height)<8) return;
+    moved=true; clearTempPin(); $('fabBar').hidden=true;
+    p.querySelector('.shapeLayer').appendChild(shapeEl(shapeFrom(x0,y0,x1,y1),state.lastColor,'tmp'));
+  };
+  const up=ev=>{
+    p.removeEventListener('pointermove',move); p.removeEventListener('pointerup',up); p.removeEventListener('pointercancel',up);
+    if(ev.type==='pointercancel'){ if(draw) clearTempPin(); return }
+    const x1=fx(ev.clientX), y1=fy(ev.clientY);
+    if(draw&&moved){ pendingSel={img:true,page:n,...shapeFrom(x0,y0,x1,y1)}; showFab('shape'); return }
+    if(Math.hypot((x1-x0)*r.width,(y1-y0)*r.height)>10) return;
+    tapImg(p,n,x0,y0,r);
+  };
+  p.addEventListener('pointermove',move); p.addEventListener('pointerup',up); p.addEventListener('pointercancel',up);
+}
+function tapImg(p,n,x,y,r){
+  const hit=hitImg(n,x,y,r);
   if(hit){hideFab();openNote(hit.id);return}
+  if(imgTool!=='pin'){hideFab();return}
   clearTempPin();
   const t=document.createElement('div'); t.className='pin temp'; t.style.left=x*100+'%'; t.style.top=y*100+'%'; t.textContent='+';
   p.querySelector('.pinLayer').appendChild(t);
@@ -660,7 +723,10 @@ async function addPhotos(d,files){
 
 /* ---------- Sélection ---------- */
 function offsetIn(root,node,off){const rg=document.createRange();rg.selectNodeContents(root);rg.setEnd(node,off);return rg.toString().length}
-function showFab(img){ $('fabHl').hidden=!!img; $('fabNote').textContent=img?'Ajouter une note ici':'Ajouter une note'; $('fabBar').hidden=false }
+function showFab(img){
+  $('fabHl').hidden=img===true; $('fabHl').textContent=img==='shape'&&imgTool==='line'?'Souligner':'Surligner';
+  $('fabNote').textContent=img===true?'Ajouter une note ici':'Ajouter une note'; $('fabBar').hidden=false;
+}
 function hideFab(){pendingSel=null;$('fabBar').hidden=true;clearTempPin()}
 function subSelection(s){
   const v=$('noteView'); subSel=null; $('subBtn').hidden=true;
@@ -711,7 +777,7 @@ function createMark(){
   if(!pendingSel) return null;
   if(pendingSel.multi){toast('Sélectionnez un passage sur une seule page.');return null}
   const d=doc(), base={id:uid(),note:'',color:state.lastColor,media:[],subs:[],tags:[]}; let m;
-  if(pendingSel.img) m={...base,page:pendingSel.page,x:pendingSel.x,y:pendingSel.y,quote:''};
+  if(pendingSel.img){ const ps=pendingSel; m={...base,page:ps.page,x:ps.x,y:ps.y,quote:''}; if(ps.shape){m.shape=ps.shape; if(ps.box)m.box=ps.box; if(ps.line)m.line=ps.line} }
   else if(d.type==='pdf') m={...base,page:pendingSel.page,rects:pendingSel.rects,quote:pendingSel.quote};
   else{
     const {start,end}=pendingSel;
